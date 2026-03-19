@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# =============================================================================
+# dotfiles-manager — dmenu dotfiles launcher → single tmux session
+# =============================================================================
+# picks a subdir from $DOTFILES_DIR via dmenu,
+# then either:
+#   - creates a new tmux session "dots" cd'd into that subdir
+#   - attaches to the existing "dots" session if one's already running
+# =============================================================================
+
+set -euo pipefail
+
+VERSION="1.1.1"
+
+# ── Config ────────────────────────────────────────────────────────────────────
+DOTFILES_DIR="${DOTFILES_DIR:-$HOME/dotfiles}"
+SESSION="dots"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles-manager"
+LOG_DIR="$HOME/.local/share/dotfiles-manager"
+LOG_FILE="$LOG_DIR/log.txt"
+CONFIG_FILE="$CONFIG_DIR/repos"
+
+# dmenu colors (tokyo night)
+DMENU_NB="${DOTFILES_DMENU_NB:-#1a1b26}"
+DMENU_NF="${DOTFILES_DMENU_NF:-#c0caf5}"
+DMENU_SB="${DOTFILES_DMENU_SB:-#7aa2f7}"
+DMENU_SF="${DOTFILES_DMENU_SF:-#1a1b26}"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+die() {
+    log "ERROR: $*"
+    echo "dotfiles-manager: $*" >&2
+    exit 1
+}
+info() {
+    local msg="$*"
+    echo "dotfiles-manager: $msg"
+    log "$msg"
+}
+
+check_deps() {
+    local missing=()
+    for cmd in dmenu tmux; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    (( ${#missing[@]} == 0 )) || die "missing deps: ${missing[*]}"
+}
+log() {
+    mkdir -p "$LOG_DIR"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# ── Config file ───────────────────────────────────────────────────────────────
+init_config() {
+    mkdir -p "$CONFIG_DIR"
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<EOF
+# dotfiles-manager repo list
+# one subdir name per line (relative to $DOTFILES_DIR)
+# lines starting with # and blank lines are ignored
+dwm-btw
+nvim
+hypr
+oxwm-btw
+EOF
+        info "created config at $CONFIG_FILE"
+    fi
+}
+
+load_entries() {
+    mapfile -t ENTRIES < <(grep -v '^\s*#' "$CONFIG_FILE" | grep -v '^\s*$')
+    (( ${#ENTRIES[@]} > 0 )) || die "no entries found in $CONFIG_FILE"
+}
+
+entry_exists() {
+    local name="$1"
+    grep -qxF "$name" "$CONFIG_FILE"
+}
+
+# ── dmenu picker ──────────────────────────────────────────────────────────────
+pick_entry() {
+    printf '%s\n' "${ENTRIES[@]}" | dmenu \
+        -nb "$DMENU_NB" -nf "$DMENU_NF" \
+        -sb "$DMENU_SB" -sf "$DMENU_SF" \
+        -i -p "dotfiles" \
+        || exit 0   # esc → clean exit
+}
+
+# ── terminal spawner ──────────────────────────────────────────────────────────
+# handles all 3 contexts: inside tmux, X11, Wayland
+_spawn() {
+    local mode="$1"   # "new" or "attach"
+    local dir="${2:-}"
+
+    if [[ -n "${TMUX:-}" ]]; then
+        # already inside tmux
+        if [[ "$mode" == "new" ]]; then
+            tmux new-session -ds "$SESSION" -c "$dir"
+        fi
+        tmux switch-client -t "$SESSION"
+    elif [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        # X11 or Wayland — find a terminal
+        local term="${TERMINAL:-}"
+        if [[ -z "$term" ]]; then
+            for t in alacritty kitty foot st; do
+                command -v "$t" &>/dev/null && term="$t" && break
+            done
+        fi
+        [[ -n "$term" ]] || die "no terminal found — set \$TERMINAL or install alacritty/kitty/foot/st"
+
+        if [[ "$mode" == "new" ]]; then
+            $term -e tmux new-session -s "$SESSION" -c "$dir" &
+        else
+            $term -e tmux attach-session -t "$SESSION" &
+        fi
+    else
+        # plain terminal context
+        if [[ "$mode" == "new" ]]; then
+            tmux new-session -s "$SESSION" -c "$dir"
+        else
+            tmux attach-session -t "$SESSION"
+        fi
+    fi
+}
+# ── core logic ────────────────────────────────────────────────────────────────
+open_session() {
+    local subdir="$1"
+    local target="$DOTFILES_DIR/$subdir"
+
+    [[ -d "$target" ]] || die "directory doesn't exist: $target"
+
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        info "attaching to existing session: $SESSION"
+        info "note: session stays in its current directory (use 'kill' to reset)"
+        _spawn attach
+    else
+        info "creating session '$SESSION' in $target"
+        _spawn new "$target"
+    fi
+}
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+cmd_list() {
+    local alive=""
+    tmux has-session -t "$SESSION" 2>/dev/null && alive=" (session active)"
+    info "dots session:$alive"
+    echo ""
+    for entry in "${ENTRIES[@]}"; do
+        local path="$DOTFILES_DIR/$entry"
+        if [[ -d "$path" ]]; then
+            printf "  %-20s  ✓\n" "$entry"
+        else
+            printf "  %-20s  ✗ missing → %s\n" "$entry" "$path"
+        fi
+    done
+}
+
+cmd_kill() {
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        read -rp "dotfiles-manager: kill session '$SESSION'? [y/N] " confirm
+        [[ "${confirm,,}" == "y" ]] || { info "aborted"; exit 0; }
+        tmux kill-session -t "$SESSION"
+        info "killed session: $SESSION"
+    else
+        info "no active '$SESSION' session"
+    fi
+}
+
+cmd_edit() {
+    "${EDITOR:-vi}" "$CONFIG_FILE"
+}
+
+cmd_cd() {
+    local subdir="$1"
+    local target="$DOTFILES_DIR/$subdir"
+    [[ -d "$target" ]] || die "directory doesn't exist: $target"
+    # print the path so the caller can: cd "$(dotfiles-manager cd <name>)"
+    echo "$target"
+}
+
+cmd_add() {
+    local name="$1"
+    [[ -n "$name" ]] || die "usage: dotfiles-manager add <name>"
+    entry_exists "$name" && die "'$name' is already in the config"
+    echo "$name" >> "$CONFIG_FILE"
+    info "added '$name' to $CONFIG_FILE"
+}
+
+cmd_remove() {
+    local name="$1"
+    [[ -n "$name" ]] || die "usage: dotfiles-manager remove <name>"
+    entry_exists "$name" || die "'$name' not found in config"
+    # portable in-place delete (no sed -i on all systems)
+    local tmp
+    tmp=$(mktemp)
+    grep -vxF "$name" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+    info "removed '$name' from $CONFIG_FILE"
+}
+
+usage() {
+    cat <<EOF
+dotfiles-manager $VERSION — dmenu dotfiles launcher → single tmux session
+
+USAGE:
+  dotfiles-manager                  open dmenu picker
+  dotfiles-manager list             list configured subdirs + session status
+  dotfiles-manager kill             kill the dots tmux session (with confirmation)
+  dotfiles-manager edit             edit the config file
+  dotfiles-manager add <name>       add an entry to the config
+  dotfiles-manager remove <name>    remove an entry from the config
+  dotfiles-manager cd <name>        print path (use with: cd "\$(dotfiles-manager cd <name>)")
+  dotfiles-manager -h|--help        show this
+  dotfiles-manager --version        show version
+
+CONFIG:
+  $CONFIG_FILE
+  one subdir name per line (relative to $DOTFILES_DIR)
+
+ENVIRONMENT:
+  DOTFILES_DIR          base dotfiles directory (default: ~/dotfiles)
+  EDITOR                editor for 'edit' subcommand
+  DOTFILES_DMENU_NB/NF  dmenu normal bg/fg colors
+  DOTFILES_DMENU_SB/SF  dmenu selected bg/fg colors
+EOF
+}
+
+# ── entry point ───────────────────────────────────────────────────────────────
+main() {
+    check_deps
+
+    case "${1:-}" in
+        -h|--help)   usage; exit 0 ;;
+        --version)   echo "dotfiles-manager $VERSION"; exit 0 ;;
+        kill)        init_config; cmd_kill; exit 0 ;;
+        edit)        init_config; cmd_edit; exit 0 ;;
+        list)        init_config; load_entries; cmd_list; exit 0 ;;
+        cd)          init_config; cmd_cd "${2:-}"; exit 0 ;;
+        add)         init_config; cmd_add "${2:-}"; exit 0 ;;
+        remove)      init_config; cmd_remove "${2:-}"; exit 0 ;;
+        "")
+            init_config
+            load_entries
+            chosen=$(pick_entry)
+            [[ -n "$chosen" ]] || exit 0
+            grep -qxF "$chosen" "$CONFIG_FILE" || die "unknown selection: $chosen"
+            open_session "$chosen"
+            ;;
+        *)
+            die "unknown subcommand: $1 (try --help)"
+            ;;
+    esac
+}
+
+main "$@"
