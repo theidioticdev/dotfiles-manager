@@ -100,7 +100,7 @@ cd "$(dotfiles-manager cd nvim)"
 |---|---|---|
 | `DOTFILES_DIR` | `~/dotfiles` | base dotfiles directory |
 | `TERMINAL` | auto-detect | terminal emulator to spawn |
-| `EDITOR` | `vi` | editor for `edit` subcommand |
+| `EDITOR` | whatever you set in your shell (on most systems, it is  `vi` by default) | editor for `edit` subcommand |
 | `DOTFILES_DMENU_NB` | `#1a1b26` | dmenu normal background |
 | `DOTFILES_DMENU_NF` | `#c0caf5` | dmenu normal foreground |
 | `DOTFILES_DMENU_SB` | `#7aa2f7` | dmenu selected background |

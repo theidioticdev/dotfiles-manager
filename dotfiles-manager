@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DOTFILES_DIR="${DOTFILES_DIR:-$HOME/dotfiles}"
@@ -20,6 +20,8 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles-manager"
 LOG_DIR="$HOME/.local/share/dotfiles-manager"
 LOG_FILE="$LOG_DIR/log.txt"
 CONFIG_FILE="$CONFIG_DIR/repos"
+MAPPINGS_FILE="$CONFIG_DIR/mappings"
+BACKUP_DIR="$LOG_DIR/backups"
 
 # dmenu colors (tokyo night)
 DMENU_NB="${DOTFILES_DMENU_NB:-#1a1b26}"
@@ -66,6 +68,18 @@ oxwm-btw
 EOF
         info "created config at $CONFIG_FILE"
     fi
+
+    if [[ ! -f "$MAPPINGS_FILE" ]]; then
+        cat > "$MAPPINGS_FILE" <<EOF
+# dotfiles-manager custom target mappings
+# override the default ~/.config/<name> target for a given subdir
+# format:  <name> = <absolute-target-path>
+# example: zsh = $HOME/.config/zsh
+# example: bash = $HOME
+# lines starting with # and blank lines are ignored
+EOF
+        info "created mappings file at $MAPPINGS_FILE"
+    fi
 }
 
 load_entries() {
@@ -76,6 +90,88 @@ load_entries() {
 entry_exists() {
     local name="$1"
     grep -qxF "$name" "$CONFIG_FILE"
+}
+
+# ── Mapping resolution ────────────────────────────────────────────────────────
+# resolve_target <name>
+# prints the destination directory for a given dotfiles subdir.
+# checks MAPPINGS_FILE first; falls back to ~/.config/<name>
+resolve_target() {
+    local name="$1"
+    local override
+
+    if [[ -f "$MAPPINGS_FILE" ]]; then
+        override=$(grep -v '^\s*#' "$MAPPINGS_FILE" \
+            | grep -v '^\s*$' \
+            | awk -F' *= *' -v key="$name" '$1 == key { print $2; exit }')
+    fi
+
+    if [[ -n "${override:-}" ]]; then
+        echo "$override"
+    else
+        echo "${XDG_CONFIG_HOME:-$HOME/.config}/$name"
+    fi
+}
+
+# ── Apply logic ───────────────────────────────────────────────────────────────
+# backup_path <target>
+# returns a timestamped backup path for a given target
+backup_path() {
+    local target="$1"
+    local ts
+    ts=$(date '+%Y%m%d_%H%M%S')
+    # flatten the path into the backup dir: /home/user/.config/nvim → nvim_20240101_120000
+    local flat
+    flat=$(echo "$target" | sed 's|/|-|g' | sed 's/^-//')
+    echo "$BACKUP_DIR/${flat}_${ts}"
+}
+
+# do_apply <name>
+# copies ~/dotfiles/<name>/ → resolved target, backing up first
+do_apply() {
+    local name="$1"
+    local src="$DOTFILES_DIR/$name"
+    local dst
+    dst=$(resolve_target "$name")
+
+    [[ -d "$src" ]] || die "'$src' doesn't exist — nothing to apply"
+
+    info "applying '$name': $src → $dst"
+
+    # backup existing destination if it exists
+    if [[ -e "$dst" ]]; then
+        local bak
+        bak=$(backup_path "$dst")
+        mkdir -p "$BACKUP_DIR"
+        cp -r "$dst" "$bak"
+        info "backed up '$dst' → '$bak'"
+    fi
+
+    # copy source → destination (create dst if needed)
+    mkdir -p "$dst"
+    cp -r "$src"/. "$dst"/
+    info "done — '$name' applied to '$dst'"
+}
+
+cmd_apply() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: dotfiles-manager apply <name>"
+    entry_exists "$name" || die "'$name' not found in config (add it first)"
+    do_apply "$name"
+}
+
+cmd_apply_all() {
+    load_entries
+    local failed=()
+    for entry in "${ENTRIES[@]}"; do
+        if ! do_apply "$entry"; then
+            failed+=("$entry")
+        fi
+    done
+    if (( ${#failed[@]} > 0 )); then
+        die "some entries failed to apply: ${failed[*]}"
+    fi
+    info "all entries applied successfully"
 }
 
 # ── dmenu picker ──────────────────────────────────────────────────────────────
@@ -123,6 +219,7 @@ _spawn() {
         fi
     fi
 }
+
 # ── core logic ────────────────────────────────────────────────────────────────
 open_session() {
     local subdir="$1"
@@ -148,8 +245,10 @@ cmd_list() {
     echo ""
     for entry in "${ENTRIES[@]}"; do
         local path="$DOTFILES_DIR/$entry"
+        local dst
+        dst=$(resolve_target "$entry")
         if [[ -d "$path" ]]; then
-            printf "  %-20s  ✓\n" "$entry"
+            printf "  %-20s  ✓  →  %s\n" "$entry" "$dst"
         else
             printf "  %-20s  ✗ missing → %s\n" "$entry" "$path"
         fi
@@ -198,24 +297,52 @@ cmd_remove() {
     info "removed '$name' from $CONFIG_FILE"
 }
 
+cmd_map() {
+    # dotfiles-manager map <name> <target>
+    # add/update a custom mapping
+    local name="${1:-}"
+    local target="${2:-}"
+    [[ -n "$name" && -n "$target" ]] || die "usage: dotfiles-manager map <name> <target-path>"
+    entry_exists "$name" || die "'$name' not found in config (add it first)"
+
+    local tmp
+    tmp=$(mktemp)
+    # remove any existing mapping for this name, then append new one
+    grep -v '^\s*#' "$MAPPINGS_FILE" \
+        | grep -v '^\s*$' \
+        | awk -F' *= *' -v key="$name" '$1 != key' > "$tmp" || true
+    # preserve comments from original
+    { grep '^\s*#' "$MAPPINGS_FILE" || true; cat "$tmp"; echo "$name = $target"; } > "${tmp}.new"
+    mv "${tmp}.new" "$MAPPINGS_FILE"
+    rm -f "$tmp"
+    info "mapped '$name' → '$target'"
+}
+
 usage() {
     cat <<EOF
 dotfiles-manager $VERSION — dmenu dotfiles launcher → single tmux session
 
 USAGE:
   dotfiles-manager                  open dmenu picker
-  dotfiles-manager list             list configured subdirs + session status
+  dotfiles-manager list             list configured subdirs + session status + targets
   dotfiles-manager kill             kill the dots tmux session (with confirmation)
   dotfiles-manager edit             edit the config file
   dotfiles-manager add <name>       add an entry to the config
   dotfiles-manager remove <name>    remove an entry from the config
   dotfiles-manager cd <name>        print path (use with: cd "\$(dotfiles-manager cd <name>)")
+  dotfiles-manager apply <name>     copy dotfiles/<name> → target (backs up existing)
+  dotfiles-manager apply-all        apply every configured entry
+  dotfiles-manager map <name> <path>  set a custom target path for an entry
   dotfiles-manager -h|--help        show this
   dotfiles-manager --version        show version
 
 CONFIG:
-  $CONFIG_FILE
-  one subdir name per line (relative to $DOTFILES_DIR)
+  repos:    $CONFIG_FILE
+  mappings: $MAPPINGS_FILE
+  backups:  $BACKUP_DIR/
+
+  Mappings format:  <name> = <absolute-target-path>
+  Default target:   ~/.config/<name>  (used when no mapping is set)
 
 ENVIRONMENT:
   DOTFILES_DIR          base dotfiles directory (default: ~/dotfiles)
@@ -238,6 +365,9 @@ main() {
         cd)          init_config; cmd_cd "${2:-}"; exit 0 ;;
         add)         init_config; cmd_add "${2:-}"; exit 0 ;;
         remove)      init_config; cmd_remove "${2:-}"; exit 0 ;;
+        apply)       init_config; cmd_apply "${2:-}"; exit 0 ;;
+        apply-all)   init_config; cmd_apply_all; exit 0 ;;
+        map)         init_config; cmd_map "${2:-}" "${3:-}"; exit 0 ;;
         "")
             init_config
             load_entries
