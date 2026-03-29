@@ -1,0 +1,362 @@
+.TH DOTFILES\-MANAGER 1 "2026-03-29" "1.4.0" "User Commands"
+.
+.SH NAME
+dotfiles\-manager \- dmenu dotfiles launcher into a tmux session or neovim
+.
+.SH SYNOPSIS
+.SY dotfiles\-manager
+.OP subcommand
+.OP args
+.YS
+.
+.SH DESCRIPTION
+.B dotfiles\-manager
+is a dmenu\-driven launcher for managing dotfiles subdirectories.
+It picks a configured subdir via dmenu and opens it either in a single
+shared tmux session
+.RB ( dots )
+or in neovim with a telescope fuzzy finder, depending on the configured mode.
+.PP
+The mode can be set globally in the settings file and overridden per\-entry
+inline in the repos file.
+When a tmux session named
+.B dots
+already exists, the tool attaches to it rather than creating a new one.
+.
+.SH SUBCOMMANDS
+When called with no arguments,
+.B dotfiles\-manager
+opens a dmenu picker and launches the selected entry.
+.TP
+.B list
+List all configured entries with their resolved mode, sync status, and target
+path. Also shows the active dotfiles directory and whether a
+.B dots
+tmux session is running.
+.TP
+.B kill
+Kill the
+.B dots
+tmux session after confirmation.
+.TP
+.B edit
+Open the repos config file in
+.BR $EDITOR .
+.TP
+.B settings
+Open the global settings file in
+.BR $EDITOR .
+.TP
+.BI add " name " [ mode ]
+Add
+.I name
+to the repos config.
+.I mode
+is optional and must be
+.B vim
+or
+.BR tmux .
+.TP
+.BI remove " name"
+Remove
+.I name
+from the repos config.
+.TP
+.BI mode " name " vim | tmux | clear
+Set or clear the per\-entry mode override for
+.I name
+without manually editing the repos file.
+.B clear
+strips the override and falls back to the global default.
+.TP
+.BI cd " name"
+Print the absolute path of the subdir for
+.IR name .
+Intended for use with a shell function:
+.PP
+.RS
+.EX
+cd "$(dotfiles\-manager cd \fIname\fP)"
+.EE
+.RE
+.TP
+.BI apply " name"
+Copy
+.IB dotfiles_dir / name /
+to its resolved target directory, backing up the existing target first.
+Up to 10 timestamped backups are kept per target; older ones are pruned.
+.TP
+.B apply\-all
+Run
+.B apply
+for every entry in the repos config.
+.TP
+.BI map " name path"
+Set a custom destination path for
+.IR name ,
+overriding the default of
+.IR ~/.config/ name .
+.TP
+.B \-h\fR,\fP \-\-help
+Print a usage summary and exit.
+.TP
+.B \-\-version
+Print the version string and exit.
+.
+.SH SESSION MODES
+.B dotfiles\-manager
+supports two modes for opening a dotfiles subdir.
+.TP
+.B tmux
+Create a new tmux session named
+.B dots
+with its working directory set to the subdir, or attach to the existing
+.B dots
+session if one is already running.
+This is the default mode.
+.TP
+.B vim
+Launch neovim with
+.B telescope.nvim
+opened via
+.BR find_files ,
+rooted at the subdir.
+If telescope is not installed, neovim falls back to opening the directory in
+.BR netrw .
+If neither
+.B nvim
+nor
+.B vim
+is found, the tool exits with an error.
+.PP
+Mode resolution follows this priority order (highest to lowest):
+.IP 1. 4
+Per\-entry override in the repos file
+.RI ( "name mode=vim" ).
+.IP 2. 4
+Global
+.B mode
+key in the settings file.
+.IP 3. 4
+Hardcoded fallback:
+.BR tmux .
+.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/dotfiles\-manager/repos
+List of dotfiles subdirs, one per line.
+Blank lines and lines starting with
+.B #
+are ignored.
+Each entry may carry an optional inline mode override:
+.PP
+.RS
+.EX
+nvim mode=vim
+dwm\-btw mode=tmux
+hypr
+.EE
+.RE
+.TP
+.I $XDG_CONFIG_HOME/dotfiles\-manager/settings
+Global key\-value configuration.
+Blank lines and lines starting with
+.B #
+are ignored.
+Supported keys:
+.RS
+.TP
+.B mode
+Default session mode.
+Must be
+.B vim
+or
+.BR tmux .
+Defaults to
+.B tmux
+if unset.
+.TP
+.B dotfiles_dir
+Root directory that contains the dotfiles subdirs.
+Tilde
+.RB ( ~ )
+is expanded.
+Overridden by the
+.B DOTFILES_DIR
+environment variable.
+Defaults to
+.I ~/dotfiles
+if unset.
+.RE
+.TP
+.I $XDG_CONFIG_HOME/dotfiles\-manager/mappings
+Custom destination path overrides, one per line, in the format:
+.PP
+.RS
+.EX
+name = /absolute/target/path
+.EE
+.PP
+When a mapping is set for an entry, it is used instead of the default
+.IR ~/.config/ name .
+.RE
+.TP
+.I $HOME/.local/share/dotfiles\-manager/log.txt
+Operation log with timestamps.
+.TP
+.I $HOME/.local/share/dotfiles\-manager/backups/
+Timestamped backups created before each
+.B apply
+operation.
+At most 10 backups are kept per target; older ones are pruned automatically.
+.
+.SH DOTFILES DIR RESOLUTION
+The root dotfiles directory is resolved in this order:
+.IP 1. 4
+.B $DOTFILES_DIR
+environment variable.
+.IP 2. 4
+.B dotfiles_dir
+key in the settings file.
+.IP 3. 4
+.I ~/dotfiles
+(hardcoded fallback).
+.PP
+A non\-fatal warning is printed if the resolved directory does not exist.
+.
+.SH ENVIRONMENT
+.TP
+.B DOTFILES_DIR
+Overrides the dotfiles root directory.
+Takes priority over
+.B dotfiles_dir
+in the settings file.
+.TP
+.B EDITOR
+Editor used by the
+.B edit
+and
+.B settings
+subcommands.
+Defaults to
+.BR vi .
+.TP
+.B TERMINAL
+Terminal emulator used when opening tmux or neovim outside an existing
+terminal context.
+Auto\-detected from
+.BR alacritty ,
+.BR kitty ,
+.BR foot ,
+and
+.B st
+(in that order) if unset.
+.TP
+.B DOTFILES_DMENU_NB
+dmenu normal background color.
+Default:
+.IR #1a1b26 .
+.TP
+.B DOTFILES_DMENU_NF
+dmenu normal foreground color.
+Default:
+.IR #c0caf5 .
+.TP
+.B DOTFILES_DMENU_SB
+dmenu selected background color.
+Default:
+.IR #7aa2f7 .
+.TP
+.B DOTFILES_DMENU_SF
+dmenu selected foreground color.
+Default:
+.IR #1a1b26 .
+.
+.SH DEPENDENCIES
+.TP
+.B dmenu
+Required for the interactive picker.
+.TP
+.B tmux
+Required for tmux mode and session management.
+.TP
+.BR nvim (1)
+or
+.BR vim (1)
+Required for vim mode.
+.TP
+.BR telescope.nvim
+Optional neovim plugin.
+Used for fuzzy file picking in vim mode.
+Falls back to netrw if not installed.
+.
+.SH EXAMPLES
+Open the dmenu picker and launch the selected subdir:
+.PP
+.RS
+.EX
+dotfiles\-manager
+.EE
+.RE
+.PP
+Add an entry that always opens in neovim:
+.PP
+.RS
+.EX
+dotfiles\-manager add nvim vim
+.EE
+.RE
+.PP
+Switch an existing entry to vim mode:
+.PP
+.RS
+.EX
+dotfiles\-manager mode hypr vim
+.EE
+.RE
+.PP
+Apply your nvim dotfiles to their target:
+.PP
+.RS
+.EX
+dotfiles\-manager apply nvim
+.EE
+.RE
+.PP
+Use a non\-default dotfiles directory for one invocation:
+.PP
+.RS
+.EX
+DOTFILES_DIR=~/work/dots dotfiles\-manager
+.EE
+.RE
+.PP
+Jump into a subdir from your shell:
+.PP
+.RS
+.EX
+cd "$(dotfiles\-manager cd hypr)"
+.EE
+.RE
+.
+.SH BUGS
+When a
+.B dots
+tmux session already exists, attaching always lands in that session's current
+working directory rather than the newly selected subdir.
+Use
+.B dotfiles\-manager kill
+to reset the session.
+.PP
+The
+.B apply
+subcommand does a full recursive copy and does not remove files that were
+deleted from the source subdir.
+Stale files must be cleaned from the target manually.
+.
+.SH SEE ALSO
+.BR dmenu (1),
+.BR tmux (1),
+.BR nvim (1),
+.BR stow (8),
+.BR chezmoi (1)

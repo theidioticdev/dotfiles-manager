@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dotfiles-manager — dmenu dotfiles launcher → single tmux session
+# dotfiles-manager — dmenu dotfiles launcher → single tmux session / nvim
 # =============================================================================
 # picks a subdir from $DOTFILES_DIR via dmenu,
 # then either:
 #   - creates a new tmux session "dots" cd'd into that subdir
+#   - opens nvim with telescope fuzzy picker rooted at that subdir
 #   - attaches to the existing "dots" session if one's already running
+#
+# mode is resolved per-entry (inline mode= tag), falling back to the global
+# default in settings, falling back to "tmux".
 # =============================================================================
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.4.0"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DOTFILES_DIR="${DOTFILES_DIR:-$HOME/dotfiles}"
+# DOTFILES_DIR is resolved after init_config runs (see resolve_dotfiles_dir).
+# Seed it from the env var if set so early callers have something to work with;
+# the real value is locked in by resolve_dotfiles_dir() inside main().
+DOTFILES_DIR="${DOTFILES_DIR:-}"
 SESSION="dots"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles-manager"
@@ -21,6 +28,7 @@ LOG_DIR="$HOME/.local/share/dotfiles-manager"
 LOG_FILE="$LOG_DIR/log.txt"
 CONFIG_FILE="$CONFIG_DIR/repos"
 MAPPINGS_FILE="$CONFIG_DIR/mappings"
+SETTINGS_FILE="$CONFIG_DIR/settings"
 BACKUP_DIR="$LOG_DIR/backups"
 
 # dmenu colors (tokyo night)
@@ -48,6 +56,7 @@ check_deps() {
     done
     (( ${#missing[@]} == 0 )) || die "missing deps: ${missing[*]}"
 }
+
 log() {
     mkdir -p "$LOG_DIR"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
@@ -56,11 +65,21 @@ log() {
 # ── Config file ───────────────────────────────────────────────────────────────
 init_config() {
     mkdir -p "$CONFIG_DIR"
+
     if [[ ! -f "$CONFIG_FILE" ]]; then
         cat > "$CONFIG_FILE" <<EOF
 # dotfiles-manager repo list
 # one subdir name per line (relative to $DOTFILES_DIR)
 # lines starting with # and blank lines are ignored
+#
+# per-entry mode override (optional):
+#   <name> mode=vim     open this entry in nvim + telescope
+#   <name> mode=tmux    open this entry in a tmux session
+#
+# examples:
+#   nvim mode=vim
+#   dwm-btw mode=tmux
+#   hypr
 dwm-btw
 nvim
 hypr
@@ -80,22 +99,122 @@ EOF
 EOF
         info "created mappings file at $MAPPINGS_FILE"
     fi
+
+    if [[ ! -f "$SETTINGS_FILE" ]]; then
+        cat > "$SETTINGS_FILE" <<EOF
+# dotfiles-manager global settings
+# key = value pairs; lines starting with # and blank lines are ignored
+#
+# dotfiles_dir — root directory that contains your dotfiles subdirs
+#   Resolution order (highest → lowest priority):
+#     1. \$DOTFILES_DIR env var
+#     2. this setting
+#     3. ~/dotfiles  (hardcoded fallback)
+#
+# dotfiles_dir = $HOME/dotfiles
+#
+# mode — default session mode when no per-entry override is set
+#   tmux  open a tmux session in the subdir (default)
+#   vim   open nvim with telescope fuzzy picker rooted at the subdir
+#
+mode = tmux
+EOF
+        info "created settings file at $SETTINGS_FILE"
+    fi
 }
 
+# ── Settings helpers ──────────────────────────────────────────────────────────
+# get_setting <key>
+# reads SETTINGS_FILE and prints the value for a given key, or "" if not found
+get_setting() {
+    local key="$1"
+    if [[ -f "$SETTINGS_FILE" ]]; then
+        grep -v '^\s*#' "$SETTINGS_FILE" \
+            | grep -v '^\s*$' \
+            | awk -F' *= *' -v k="$key" '$1==k { print $2; exit }'
+    fi
+}
+
+# resolve_dotfiles_dir
+# locks in DOTFILES_DIR: env var → settings file → ~/dotfiles fallback
+# warns (but continues) if the resolved dir doesn't exist
+resolve_dotfiles_dir() {
+    if [[ -n "${DOTFILES_DIR:-}" ]]; then
+        DOTFILES_DIR_FROM_ENV=1          :
+    else
+        local from_settings
+        from_settings=$(get_setting "dotfiles_dir")
+        if [[ -n "$from_settings" ]]; then
+            DOTFILES_DIR="${from_settings/#\~/$HOME}"
+        else
+            DOTFILES_DIR="$HOME/dotfiles"
+        fi
+    fi
+
+    if [[ ! -d "$DOTFILES_DIR" ]]; then
+        echo "dotfiles-manager: warning: dotfiles_dir '$DOTFILES_DIR' does not exist" >&2
+        log "WARNING: dotfiles_dir '$DOTFILES_DIR' does not exist"
+    fi
+}
+
+# ── Entry loading ─────────────────────────────────────────────────────────────
+# ENTRIES — plain names (no mode tag)
+# ENTRY_MODES — associative array: name → mode override (or "")
+declare -A ENTRY_MODES
+
 load_entries() {
-    mapfile -t ENTRIES < <(grep -v '^\s*#' "$CONFIG_FILE" | grep -v '^\s*$')
+    ENTRIES=()
+    while IFS= read -r line; do
+        # strip leading/trailing whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        local name mode_override=""
+        # check for inline mode=vim or mode=tmux tag
+        if [[ "$line" =~ ^([^[:space:]]+)[[:space:]]+mode=(vim|tmux)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            mode_override="${BASH_REMATCH[2]}"
+        else
+            name="$line"
+        fi
+
+        ENTRIES+=("$name")
+        ENTRY_MODES["$name"]="$mode_override"
+    done < "$CONFIG_FILE"
+
     (( ${#ENTRIES[@]} > 0 )) || die "no entries found in $CONFIG_FILE"
 }
 
 entry_exists() {
     local name="$1"
-    grep -qxF "$name" "$CONFIG_FILE"
+    # check raw name (without mode tag) in config
+    grep -qE "^[[:space:]]*${name}([[:space:]]|$)" "$CONFIG_FILE"
+}
+
+# ── Mode resolution ───────────────────────────────────────────────────────────
+# resolve_mode <name>
+# priority: per-entry override → global setting → hardcoded default (tmux)
+resolve_mode() {
+    local name="$1"
+    local override="${ENTRY_MODES[$name]:-}"
+
+    if [[ -n "$override" ]]; then
+        echo "$override"
+        return
+    fi
+
+    local global
+    global=$(get_setting "mode")
+    if [[ "$global" == "vim" || "$global" == "tmux" ]]; then
+        echo "$global"
+        return
+    fi
+
+    echo "tmux"
 }
 
 # ── Mapping resolution ────────────────────────────────────────────────────────
-# resolve_target <name>
-# prints the destination directory for a given dotfiles subdir.
-# checks MAPPINGS_FILE first; falls back to ~/.config/<name>
 resolve_target() {
     local name="$1"
     local override
@@ -114,20 +233,15 @@ resolve_target() {
 }
 
 # ── Apply logic ───────────────────────────────────────────────────────────────
-# backup_path <target>
-# returns a timestamped backup path for a given target
 backup_path() {
     local target="$1"
     local ts
     ts=$(date '+%Y%m%d_%H%M%S')
-    # flatten the path into the backup dir: /home/user/.config/nvim → nvim_20240101_120000
     local flat
     flat=$(echo "$target" | sed 's|/|-|g' | sed 's/^-//')
     echo "$BACKUP_DIR/${flat}_${ts}"
 }
 
-# do_apply <name>
-# copies ~/dotfiles/<name>/ → resolved target, backing up first
 do_apply() {
     local name="$1"
     local src="$DOTFILES_DIR/$name"
@@ -138,18 +252,21 @@ do_apply() {
 
     info "applying '$name': $src → $dst"
 
-    # backup existing destination if it exists
     if [[ -e "$dst" ]]; then
         local bak
         bak=$(backup_path "$dst")
         mkdir -p "$BACKUP_DIR"
         cp -r "$dst" "$bak"
         info "backed up '$dst' → '$bak'"
+
+        # prune: keep only 10 most recent backups for this target
+        local flat
+        flat=$(echo "$dst" | sed 's|/|-|g' | sed 's/^-//')
+        ls -dt "$BACKUP_DIR/${flat}"_* 2>/dev/null | tail -n +11 | xargs -d '\n' rm -rf -- 2>/dev/null || true
     fi
 
-    # copy source → destination (create dst if needed)
     mkdir -p "$dst"
-    cp -r "$src"/. "$dst"/
+    rsync -a --delete "$src"/ "$dst"/
     info "done — '$name' applied to '$dst'"
 }
 
@@ -180,23 +297,80 @@ pick_entry() {
         -nb "$DMENU_NB" -nf "$DMENU_NF" \
         -sb "$DMENU_SB" -sf "$DMENU_SF" \
         -i -p "dotfiles" \
-        || exit 0   # esc → clean exit
+        || exit 0
 }
 
-# ── terminal spawner ──────────────────────────────────────────────────────────
-# handles all 3 contexts: inside tmux, X11, Wayland
+# ── vim/nvim spawner ──────────────────────────────────────────────────────────
+# _spawn_vim <dir>
+# opens nvim with telescope find_files rooted at <dir>.
+# falls back to plain netrw if telescope isn't available.
+_spawn_vim() {
+    local dir="$1"
+
+    # detect nvim or vim
+    local editor
+    if command -v nvim &>/dev/null; then
+        editor="nvim"
+    elif command -v vim &>/dev/null; then
+        editor="vim"
+    else
+        die "no nvim or vim found — install one or switch to mode=tmux"
+    fi
+
+    # build the lua bootstrap:
+    #   1. cd into the subdir so all relative paths resolve correctly
+    #   2. try to load telescope; if it works, open find_files there
+    #   3. if telescope isn't installed, fall back to netrw on the dir
+    local lua_cmd
+    lua_cmd=$(cat <<'LUA'
+vim.fn.chdir(vim.g.dotfiles_dir)
+local ok, telescope = pcall(require, "telescope.builtin")
+if ok then
+  telescope.find_files({
+    cwd = vim.g.dotfiles_dir,
+    prompt_title = "dotfiles: " .. vim.fn.fnamemodify(vim.g.dotfiles_dir, ":t"),
+    hidden = true,
+  })
+else
+  -- telescope not found, fall back to netrw
+  vim.cmd("edit " .. vim.fn.fnameescape(vim.g.dotfiles_dir))
+end
+LUA
+)
+
+    local nvim_args=(
+        --cmd "let g:dotfiles_dir='$dir'"
+        -c "lua $lua_cmd"
+    )
+
+    if [[ -n "${TMUX:-}" ]]; then
+        # inside tmux — open in a new window
+        tmux new-window -c "$dir" "$editor ${nvim_args[*]}"
+    elif [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        local term="${TERMINAL:-}"
+        if [[ -z "$term" ]]; then
+            for t in alacritty kitty foot st; do
+                command -v "$t" &>/dev/null && term="$t" && break
+            done
+        fi
+        [[ -n "$term" ]] || die "no terminal found — set \$TERMINAL or install alacritty/kitty/foot/st"
+        $term -e "$editor" "${nvim_args[@]}" &
+    else
+        "$editor" "${nvim_args[@]}"
+    fi
+}
+
+# ── tmux spawner ──────────────────────────────────────────────────────────────
 _spawn() {
     local mode="$1"   # "new" or "attach"
     local dir="${2:-}"
 
     if [[ -n "${TMUX:-}" ]]; then
-        # already inside tmux
         if [[ "$mode" == "new" ]]; then
             tmux new-session -ds "$SESSION" -c "$dir"
         fi
         tmux switch-client -t "$SESSION"
     elif [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
-        # X11 or Wayland — find a terminal
         local term="${TERMINAL:-}"
         if [[ -z "$term" ]]; then
             for t in alacritty kitty foot st; do
@@ -211,7 +385,6 @@ _spawn() {
             $term -e tmux attach-session -t "$SESSION" &
         fi
     else
-        # plain terminal context
         if [[ "$mode" == "new" ]]; then
             tmux new-session -s "$SESSION" -c "$dir"
         else
@@ -224,9 +397,18 @@ _spawn() {
 open_session() {
     local subdir="$1"
     local target="$DOTFILES_DIR/$subdir"
+    local mode
+    mode=$(resolve_mode "$subdir")
 
     [[ -d "$target" ]] || die "directory doesn't exist: $target"
 
+    if [[ "$mode" == "vim" ]]; then
+        info "opening '$subdir' in nvim + telescope (mode=vim)"
+        _spawn_vim "$target"
+        return
+    fi
+
+    # tmux mode
     if tmux has-session -t "$SESSION" 2>/dev/null; then
         info "attaching to existing session: $SESSION"
         info "note: session stays in its current directory (use 'kill' to reset)"
@@ -241,16 +423,29 @@ open_session() {
 cmd_list() {
     local alive=""
     tmux has-session -t "$SESSION" 2>/dev/null && alive=" (session active)"
-    info "dots session:$alive"
+    local global_mode
+    global_mode=$(get_setting "mode")
+    [[ -z "$global_mode" ]] && global_mode="tmux"
+
+    local dir_src="settings"
+    [[ -n "${DOTFILES_DIR_FROM_ENV:-}" ]] && dir_src="env"
+
+    info "dotfiles dir: $DOTFILES_DIR  (from $dir_src)"
+    info "dots session:$alive  |  global mode: $global_mode"
     echo ""
     for entry in "${ENTRIES[@]}"; do
         local path="$DOTFILES_DIR/$entry"
         local dst
         dst=$(resolve_target "$entry")
+        local mode
+        mode=$(resolve_mode "$entry")
+        local mode_src=""
+        [[ -n "${ENTRY_MODES[$entry]:-}" ]] && mode_src=" (per-entry)" || mode_src=" (global)"
+
         if [[ -d "$path" ]]; then
-            printf "  %-20s  ✓  →  %s\n" "$entry" "$dst"
+            printf "  %-20s  ✓  mode=%-4s%s  →  %s\n" "$entry" "$mode" "$mode_src" "$dst"
         else
-            printf "  %-20s  ✗ missing → %s\n" "$entry" "$path"
+            printf "  %-20s  ✗ missing   mode=%-4s%s  →  %s\n" "$entry" "$mode" "$mode_src" "$path"
         fi
     done
 }
@@ -270,83 +465,135 @@ cmd_edit() {
     "${EDITOR:-vi}" "$CONFIG_FILE"
 }
 
+cmd_settings() {
+    "${EDITOR:-vi}" "$SETTINGS_FILE"
+}
+
 cmd_cd() {
     local subdir="$1"
     local target="$DOTFILES_DIR/$subdir"
     [[ -d "$target" ]] || die "directory doesn't exist: $target"
-    # print the path so the caller can: cd "$(dotfiles-manager cd <name>)"
     echo "$target"
 }
 
 cmd_add() {
-    local name="$1"
-    [[ -n "$name" ]] || die "usage: dotfiles-manager add <name>"
+    local name="${1:-}"
+    local mode_tag="${2:-}"
+    [[ -n "$name" ]] || die "usage: dotfiles-manager add <name> [vim|tmux]"
     entry_exists "$name" && die "'$name' is already in the config"
-    echo "$name" >> "$CONFIG_FILE"
+
+    if [[ -n "$mode_tag" ]]; then
+        [[ "$mode_tag" == "vim" || "$mode_tag" == "tmux" ]] \
+            || die "invalid mode '$mode_tag' — use vim or tmux"
+        echo "$name mode=$mode_tag" >> "$CONFIG_FILE"
+    else
+        echo "$name" >> "$CONFIG_FILE"
+    fi
     info "added '$name' to $CONFIG_FILE"
 }
 
 cmd_remove() {
-    local name="$1"
+    local name="${1:-}"
     [[ -n "$name" ]] || die "usage: dotfiles-manager remove <name>"
     entry_exists "$name" || die "'$name' not found in config"
-    # portable in-place delete (no sed -i on all systems)
     local tmp
     tmp=$(mktemp)
-    grep -vxF "$name" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+    grep -vE "^[[:space:]]*${name}([[:space:]]|$)" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
     info "removed '$name' from $CONFIG_FILE"
 }
 
 cmd_map() {
-    # dotfiles-manager map <name> <target>
-    # add/update a custom mapping
     local name="${1:-}"
     local target="${2:-}"
     [[ -n "$name" && -n "$target" ]] || die "usage: dotfiles-manager map <name> <target-path>"
     entry_exists "$name" || die "'$name' not found in config (add it first)"
 
+    local tmp comments non_comments
+    tmp=$(mktemp)
+    comments=$(grep '^\s*#' "$MAPPINGS_FILE" || true)
+    non_comments=$(grep -v '^\s*#' "$MAPPINGS_FILE" | grep -v '^\s*$' | awk -F' *= *' -v key="$name" '$1 != key' || true)
+    { echo "$comments"; echo "$non_comments"; echo "$name = $target"; } > "$tmp"
+    mv "$tmp" "$MAPPINGS_FILE"
+    info "mapped '$name' → '$target'"
+}
+
+# cmd_mode <name> <vim|tmux|clear>
+# set or clear a per-entry mode override directly (without editing the file)
+cmd_mode() {
+    local name="${1:-}"
+    local mode="${2:-}"
+    [[ -n "$name" && -n "$mode" ]] || die "usage: dotfiles-manager mode <name> <vim|tmux|clear>"
+    entry_exists "$name" || die "'$name' not found in config"
+
     local tmp
     tmp=$(mktemp)
-    # remove any existing mapping for this name, then append new one
-    grep -v '^\s*#' "$MAPPINGS_FILE" \
-        | grep -v '^\s*$' \
-        | awk -F' *= *' -v key="$name" '$1 != key' > "$tmp" || true
-    # preserve comments from original
-    { grep '^\s*#' "$MAPPINGS_FILE" || true; cat "$tmp"; echo "$name = $target"; } > "${tmp}.new"
-    mv "${tmp}.new" "$MAPPINGS_FILE"
-    rm -f "$tmp"
-    info "mapped '$name' → '$target'"
+
+    if [[ "$mode" == "clear" ]]; then
+        # strip any mode= tag from the entry, leaving just the name
+        sed -E "s/^([[:space:]]*${name})[[:space:]]+mode=(vim|tmux)[[:space:]]*$/\1/" "$CONFIG_FILE" > "$tmp"
+        mv "$tmp" "$CONFIG_FILE"
+        info "cleared mode override for '$name'"
+    elif [[ "$mode" == "vim" || "$mode" == "tmux" ]]; then
+        # update or add mode= tag
+        sed -E "s/^([[:space:]]*${name})([[:space:]]+mode=(vim|tmux))?[[:space:]]*$/\1 mode=${mode}/" "$CONFIG_FILE" > "$tmp"
+        mv "$tmp" "$CONFIG_FILE"
+        info "set mode for '$name' → $mode"
+    else
+        die "invalid mode '$mode' — use vim, tmux, or clear"
+    fi
 }
 
 usage() {
     cat <<EOF
-dotfiles-manager $VERSION — dmenu dotfiles launcher → single tmux session
+dotfiles-manager $VERSION — dmenu dotfiles launcher → tmux session or nvim
 
 USAGE:
-  dotfiles-manager                  open dmenu picker
-  dotfiles-manager list             list configured subdirs + session status + targets
-  dotfiles-manager kill             kill the dots tmux session (with confirmation)
-  dotfiles-manager edit             edit the config file
-  dotfiles-manager add <name>       add an entry to the config
-  dotfiles-manager remove <name>    remove an entry from the config
-  dotfiles-manager cd <name>        print path (use with: cd "\$(dotfiles-manager cd <name>)")
-  dotfiles-manager apply <name>     copy dotfiles/<name> → target (backs up existing)
-  dotfiles-manager apply-all        apply every configured entry
-  dotfiles-manager map <name> <path>  set a custom target path for an entry
-  dotfiles-manager -h|--help        show this
-  dotfiles-manager --version        show version
+  dotfiles-manager                      open dmenu picker
+  dotfiles-manager list                 list entries, modes, targets + session status
+  dotfiles-manager kill                 kill the dots tmux session (with confirmation)
+  dotfiles-manager edit                 edit the repos config file
+  dotfiles-manager settings            edit the global settings file
+  dotfiles-manager add <name> [mode]   add an entry (mode: vim or tmux, optional)
+  dotfiles-manager remove <name>       remove an entry from the config
+  dotfiles-manager mode <name> <mode>  set per-entry mode (vim, tmux, or clear)
+  dotfiles-manager cd <name>           print path (use with: cd "\$(dotfiles-manager cd <name>)")
+  dotfiles-manager apply <name>        copy dotfiles/<name> → target (backs up existing)
+  dotfiles-manager apply-all           apply every configured entry
+  dotfiles-manager map <name> <path>   set a custom target path for an entry
+  dotfiles-manager -h|--help           show this
+  dotfiles-manager --version           show version
+
+SESSION MODES:
+  tmux   open a tmux session "dots" cd'd into the subdir (default)
+  vim    open nvim with telescope find_files rooted at the subdir
+         falls back to netrw if telescope is not installed
+
+  Mode resolution order (highest → lowest priority):
+    1. per-entry override  (e.g. "nvim mode=vim" in repos)
+    2. global default      (mode = vim/tmux in settings)
+    3. hardcoded fallback  (tmux)
 
 CONFIG:
   repos:    $CONFIG_FILE
+  settings: $SETTINGS_FILE
   mappings: $MAPPINGS_FILE
   backups:  $BACKUP_DIR/
 
-  Mappings format:  <name> = <absolute-target-path>
-  Default target:   ~/.config/<name>  (used when no mapping is set)
+  repos format:     <n> [mode=vim|tmux]
+  mappings format:  <n> = <absolute-target-path>
+  Default target:   ~/.config/<n>  (used when no mapping is set)
+
+DOTFILES DIR resolution order (highest → lowest priority):
+  1. \$DOTFILES_DIR env var
+  2. dotfiles_dir = <path>  in settings file
+  3. ~/dotfiles  (hardcoded fallback)
+
+  warning (non-fatal) is printed if the resolved dir does not exist.
 
 ENVIRONMENT:
-  DOTFILES_DIR          base dotfiles directory (default: ~/dotfiles)
-  EDITOR                editor for 'edit' subcommand
+  DOTFILES_DIR          override dotfiles root dir (beats settings file)
+  EDITOR                editor for 'edit' and 'settings' subcommands
+  TERMINAL              terminal emulator (auto-detected if unset)
   DOTFILES_DMENU_NB/NF  dmenu normal bg/fg colors
   DOTFILES_DMENU_SB/SF  dmenu selected bg/fg colors
 EOF
@@ -359,21 +606,24 @@ main() {
     case "${1:-}" in
         -h|--help)   usage; exit 0 ;;
         --version)   echo "dotfiles-manager $VERSION"; exit 0 ;;
-        kill)        init_config; cmd_kill; exit 0 ;;
-        edit)        init_config; cmd_edit; exit 0 ;;
-        list)        init_config; load_entries; cmd_list; exit 0 ;;
-        cd)          init_config; cmd_cd "${2:-}"; exit 0 ;;
-        add)         init_config; cmd_add "${2:-}"; exit 0 ;;
-        remove)      init_config; cmd_remove "${2:-}"; exit 0 ;;
-        apply)       init_config; cmd_apply "${2:-}"; exit 0 ;;
-        apply-all)   init_config; cmd_apply_all; exit 0 ;;
-        map)         init_config; cmd_map "${2:-}" "${3:-}"; exit 0 ;;
+        kill)        init_config; resolve_dotfiles_dir; cmd_kill; exit 0 ;;
+        edit)        init_config; resolve_dotfiles_dir; cmd_edit; exit 0 ;;
+        settings)    init_config; resolve_dotfiles_dir; cmd_settings; exit 0 ;;
+        list)        init_config; resolve_dotfiles_dir; load_entries; cmd_list; exit 0 ;;
+        cd)          init_config; resolve_dotfiles_dir; cmd_cd "${2:-}"; exit 0 ;;
+        add)         init_config; resolve_dotfiles_dir; cmd_add "${2:-}" "${3:-}"; exit 0 ;;
+        remove)      init_config; resolve_dotfiles_dir; cmd_remove "${2:-}"; exit 0 ;;
+        apply)       init_config; resolve_dotfiles_dir; cmd_apply "${2:-}"; exit 0 ;;
+        apply-all)   init_config; resolve_dotfiles_dir; cmd_apply_all; exit 0 ;;
+        map)         init_config; resolve_dotfiles_dir; cmd_map "${2:-}" "${3:-}"; exit 0 ;;
+        mode)        init_config; resolve_dotfiles_dir; cmd_mode "${2:-}" "${3:-}"; exit 0 ;;
         "")
             init_config
+            resolve_dotfiles_dir
             load_entries
             chosen=$(pick_entry)
             [[ -n "$chosen" ]] || exit 0
-            grep -qxF "$chosen" "$CONFIG_FILE" || die "unknown selection: $chosen"
+            entry_exists "$chosen" || die "unknown selection: $chosen"
             open_session "$chosen"
             ;;
         *)
