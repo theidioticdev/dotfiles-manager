@@ -258,15 +258,11 @@ do_apply() {
         mkdir -p "$BACKUP_DIR"
         cp -r "$dst" "$bak"
         info "backed up '$dst' → '$bak'"
-
-        # prune: keep only 10 most recent backups for this target
-        local flat
-        flat=$(echo "$dst" | sed 's|/|-|g' | sed 's/^-//')
-        ls -dt "$BACKUP_DIR/${flat}"_* 2>/dev/null | tail -n +11 | xargs -d '\n' rm -rf -- 2>/dev/null || true
     fi
 
     mkdir -p "$dst"
-    rsync -a --delete "$src"/ "$dst"/
+    cp -r "$src"/. "$dst"/
+    ls -dt "$BACKUP_DIR/${flat}"_* | tail -n +11 | xargs -d '\n' rm -rf -- 2>/dev/null || true
     info "done — '$name' applied to '$dst'"
 }
 
