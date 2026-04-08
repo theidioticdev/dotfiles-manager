@@ -16,5 +16,7 @@ git clone https://github.com/theidioticdev/dotfiles-manager "$TMP/repo"
 
 install -Dm755 "$TMP/repo/dotfiles-manager"   "$PREFIX/bin/dotfiles-manager"
 install -Dm644 "$TMP/repo/dotfiles-manager.1" "$PREFIX/share/man/man1/dotfiles-manager.1"
+install -Dm644 "$TMP/repo/dotfiles-manager.desktop" "$PREFIX/share/applications/dotfiles-manager.desktop"
+mandb -q 2>/dev/null || true  
 
 echo "done! run 'dotfiles-manager -h' for help"

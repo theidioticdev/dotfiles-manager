@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Dotfiles Manager for UNIX-like OSes
+Exec=dotfiles-manager
+Type=Application
+Terminal=true
+Categories=Utility;
+Comment=dmenu-based dotfiles launcher

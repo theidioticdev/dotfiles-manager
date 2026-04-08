@@ -2,7 +2,7 @@
 
 a dmenu-based dotfiles launcher that drops you into a tmux session or neovim, cd'd into whichever dotfiles subdir you pick.
 
-forget stow. forget chezmoi. forget manually navigating your dotfiles.
+
 
 ## how it works
 
@@ -16,7 +16,6 @@ forget stow. forget chezmoi. forget manually navigating your dotfiles.
 
 - `dmenu`
 - `tmux`
-- `rsync`
 - a terminal emulator (see [setup](#setup))
 - `nvim` or `vim` — only needed if you use vim mode
 - [`telescope.nvim`](https://github.com/nvim-telescope/telescope.nvim) — optional, falls back to netrw if not installed
