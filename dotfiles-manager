@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DOTFILES_DIR="${DOTFILES_DIR:-}"
@@ -521,6 +521,30 @@ cmd_mode() {
     fi
 }
 
+cmd_rollback() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: dotfiles-manager rollback <name>"
+    entry_exists "$name" || die "'$name' not found in config"
+
+    local dst
+    dst=$(resolve_target "$name")
+    local flat="${dst//\//-}"
+    flat="${flat#-}"
+
+    mapfile -t backups < <(ls -dt "$BACKUP_DIR/${flat}"_* 2>/dev/null)
+    (( ${#backups[@]} > 0 )) || die "no backups found for '$name'"
+
+    local chosen
+    chosen=$(printf '%s\n' "${backups[@]}" | dmenu \
+        -nb "$dmenu_nb" -nf "$dmenu_nf" \
+        -sb "$dmenu_sb" -sf "$dmenu_sf" \
+        -i -p "rollback $name")
+    [[ -n "$chosen" ]] || exit 0
+
+    cp -r "$chosen/." "$dst/"
+    info "rolled back '$name' from '$chosen'"
+}
+
 usage() {
     cat <<EOF
 dotfiles-manager $VERSION — dmenu dotfiles launcher → tmux session or nvim
@@ -538,6 +562,7 @@ USAGE:
   dotfiles-manager apply <name>        copy dotfiles/<name> → target (backs up existing)
   dotfiles-manager apply-all           apply every configured entry
   dotfiles-manager map <name> <path>   set a custom target path for an entry
+  dotfiles-manager rollback <name>     rollback a config using an existing backup
   dotfiles-manager -h|--help           show this
   dotfiles-manager --version           show version
 
@@ -595,6 +620,7 @@ main() {
         apply-all)   init_config; resolve_dotfiles_dir; cmd_apply_all; exit 0 ;;
         map)         init_config; resolve_dotfiles_dir; cmd_map "${2:-}" "${3:-}"; exit 0 ;;
         mode)        init_config; resolve_dotfiles_dir; cmd_mode "${2:-}" "${3:-}"; exit 0 ;;
+        rollback)    init_config; resolve_dotfiles_dir; cmd_rollback "${2:-}"; exit 0 ;;
         "")
             init_config
             resolve_dotfiles_dir
