@@ -1,4 +1,4 @@
-.TH DOTFILES\-MANAGER 1 "2026-03-29" "1.4.0" "User Commands"
+.TH DOTFILES\-MANAGER 1 "2026-04-09" "1.4.1" "User Commands"
 .
 .SH NAME
 dotfiles\-manager \- dmenu dotfiles launcher into a tmux session or neovim
@@ -103,6 +103,10 @@ Print a usage summary and exit.
 .B \-\-version
 Print the version string and exit.
 .
+.TP
+.B rollback <name>
+Roll back a configured entry to a previously backed-up version.
+Presents a dmenu picker to choose which backup to restore.
 .SH SESSION MODES
 .B dotfiles\-manager
 supports two modes for opening a dotfiles subdir.

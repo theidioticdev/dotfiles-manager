@@ -132,6 +132,7 @@ dotfiles-manager apply-all              apply every configured entry
 dotfiles-manager map <name> <path>      set a custom target path for an entry
 dotfiles-manager -h|--help              show help
 dotfiles-manager --version              show version
+dotfiles-manager rollback <name>        rollback
 ```
 
 ### cd into a subdir from your shell
